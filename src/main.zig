@@ -39,7 +39,7 @@ pub fn main() !void {
     var threads: [5]?std.Thread = .{ null, null, null, null, null };
 
     if (git_root) |root| {
-        git_main_ctx = .{ .allocator = allocator, .repo_root = root.repo_root };
+        git_main_ctx = .{ .allocator = allocator, .repo_root = root.repo_root, .git_dir = root.git_dir };
         git_extras_ctx = .{ .allocator = allocator, .git_dir = root.git_dir, .repo_root = root.repo_root };
         threads[0] = std.Thread.spawn(.{}, git.gitMainWorker, .{&git_main_ctx}) catch null;
         threads[1] = std.Thread.spawn(.{}, git.gitExtrasWorker, .{&git_extras_ctx}) catch null;

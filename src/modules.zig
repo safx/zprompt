@@ -204,7 +204,34 @@ pub fn writeDirectory(w: *Writer, cwd: []const u8, repo_root: ?[]const u8) !void
         const repo_name = root[repo_name_start..];
         const inside = if (cwd.len > root.len) cwd[root.len..] else "";
 
-        if (before_root_raw.len > 0) {
+        // Check if before_root_raw contains /.worktrees/ (worktree layout)
+        // e.g. before_root_raw = "~/src/backlog/backlog-ai-agent/.worktrees/"
+        //      repo_name = "b"
+        // We want: gray(~/src/backlog/) white(backlog-ai-agent) gray(/.worktrees/) white(b)
+        if (std.mem.indexOf(u8, before_root_raw, "/.worktrees/")) |wt_pos| {
+            // Part before the parent repo name
+            const parent_name_start = if (std.mem.lastIndexOfScalar(u8, before_root_raw[0..wt_pos], '/')) |idx| idx + 1 else 0;
+            const prefix = before_root_raw[0..parent_name_start];
+            const parent_name = before_root_raw[parent_name_start..wt_pos];
+            const wt_suffix = before_root_raw[wt_pos..]; // "/.worktrees/"
+
+            if (prefix.len > 0) {
+                if (home.len > 0 and std.mem.startsWith(u8, prefix, home)) {
+                    try w.writeAll(style.fg_666);
+                    try w.writeAll("~");
+                    try w.writeAll(truncatePath(prefix[home.len..], 10));
+                    try w.writeAll(style.reset);
+                } else {
+                    try w.writeAll(style.fg_666);
+                    try w.writeAll(truncatePath(prefix, 10));
+                    try w.writeAll(style.reset);
+                }
+            }
+            try style.styled(w, style.white, parent_name);
+            try w.writeAll(style.fg_666);
+            try w.writeAll(wt_suffix);
+            try w.writeAll(style.reset);
+        } else if (before_root_raw.len > 0) {
             if (home.len > 0 and std.mem.startsWith(u8, before_root_raw, home)) {
                 try w.writeAll(style.fg_666);
                 try w.writeAll("~");
@@ -260,7 +287,7 @@ pub fn writeCmdDuration(w: *Writer, duration_ms: u64) !void {
 
 pub fn writeCharacter(w: *Writer, exit_code: u8) !void {
     const color = if (exit_code == 0) style.green else style.red;
-    try style.styled(w, color, "\xe2\x9d\xaf"); // ❯
+    try style.styled(w, color, "\xe2\x9d\xaf "); // ❯
 }
 
 pub fn writePython(w: *Writer, info: PythonInfo) !void {
