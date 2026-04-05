@@ -1,0 +1,8 @@
+.{
+    .name = .zprompt,
+    .fingerprint = 0x6599d80acccc2d3,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .paths = .{"."},
+    .dependencies = .{},
+}
