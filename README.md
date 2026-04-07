@@ -14,16 +14,20 @@ A fast, minimal zsh prompt written in Zig. Replaces [Starship](https://starship.
 
 ```
 [blank line]
-HH:MM:SS ~/path/to/repo_root/subdir  a3f7b2c main(:origin/main) ●●▴ +12 -3 py3.11(@venv) js22.1.0
+HH:MM:SS ~/path/to/repo_root/subdir main ●●▴ +12 -3 py3.11(@venv) js22.1.0
+❯
+
+# Detached HEAD with tags
+HH:MM:SS ~/path/to/repo a3f7b2c 🏷️(9) shortest-tag ● js22.1.0
 ❯
 ```
 
 | Segment | Source | Description |
 |---|---|---|
 | time | `std.time` | UTC+9 (JST), `HH:MM:SS` |
-| directory | CWD | 3-color split in git repos: path (gray) / root (white) / inside (green) |
-| git_commit | `git status --porcelain=v2` | 7-char hash + tag (if exact match) |
-| git_branch | `git status --porcelain=v2` | branch name + tracking remote |
+| directory | CWD | 3-color split in git repos: path (gray) / root (white) / inside (green). Worktree paths highlight both parent repo and worktree name in white |
+| git_commit | `git status --porcelain=v2` | 7-char hash (detached HEAD only) + 🏷️ tag(s) if present |
+| git_branch | `git status --porcelain=v2` | branch name (remote hidden when `origin/<branch>`) |
 | git_status | `git status --porcelain=v2` | `⊘` conflicted, `✘` deleted, `»` renamed, `●` modified/untracked/staged, `▴▾` ahead/behind |
 | git_state | `.git/` file checks | REBASING, MERGING, CHERRY-PICKING, REVERTING, BISECTING with progress |
 | git_metrics | `git diff --numstat HEAD` | `+added` / `-deleted` lines (each shown independently when > 0) |
@@ -87,7 +91,7 @@ src/
 
 | Thread | Work | Method |
 |---|---|---|
-| git_main | branch, status, ahead/behind, hash, tag | `git status --porcelain=v2 --branch` + `git describe` |
+| git_main | branch, status, ahead/behind, hash, tag | `git status --porcelain=v2 --branch` + `git tag --points-at HEAD` |
 | git_extras | state detection, diff metrics | `.git/` file reads + `git diff --numstat` |
 | python | version + virtualenv | marker file check + `python3 --version` |
 | node | version | marker file check + `node --version` |

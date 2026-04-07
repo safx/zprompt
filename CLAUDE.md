@@ -59,7 +59,7 @@ The `doFoo` function returns `?ResultType`. All errors convert to `null` via `ca
 
 ### Git info collection strategy
 
-- **git_main_worker**: Runs `git status --porcelain=v2 --branch` — one subprocess yields branch, remote, ahead/behind, HEAD hash, and all file status counts. Then runs `git describe --tags --exact-match` for tag.
+- **git_main_worker**: Runs `git status --porcelain=v2 --branch` — one subprocess yields branch, remote, ahead/behind, HEAD hash, and all file status counts. Then runs `git tag --points-at HEAD` for tags (returns all tags, displays count + shortest name).
 - **git_extras_worker**: Checks `.git/` state files (rebase-merge, MERGE_HEAD, etc.) via direct file reads. Runs `git diff --numstat HEAD` for metrics.
 
 ### Output format

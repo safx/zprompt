@@ -11,6 +11,7 @@ pub const GitMainResult = struct {
     remote: ?[]const u8 = null,
     hash: ?[7]u8 = null,
     tag: ?[]const u8 = null,
+    tag_count: u32 = 0,
     status: GitStatus = .{},
 };
 
@@ -133,8 +134,8 @@ pub fn gitExtrasWorker(ctx: *GitExtrasCtx) void {
 }
 
 fn doGitMain(allocator: Allocator, repo_root: []const u8, git_dir: []const u8) ?GitMainResult {
+    _ = git_dir;
     var result = GitMainResult{};
-    var full_oid: ?*const [40]u8 = null;
 
     const status_out = runGit(allocator, repo_root, &.{ "git", "status", "--porcelain=v2", "--branch" }) orelse return null;
     defer allocator.free(status_out);
@@ -145,9 +146,8 @@ fn doGitMain(allocator: Allocator, repo_root: []const u8, git_dir: []const u8) ?
 
         if (std.mem.startsWith(u8, line, "# branch.oid ")) {
             const oid = line["# branch.oid ".len..];
-            if (oid.len >= 40 and !std.mem.eql(u8, oid[0..9], "(initial)")) {
+            if (oid.len >= 7 and !std.mem.eql(u8, oid, "(initial)")) {
                 result.hash = oid[0..7].*;
-                full_oid = oid[0..40];
             }
         } else if (std.mem.startsWith(u8, line, "# branch.head ")) {
             const head = line["# branch.head ".len..];
@@ -169,8 +169,10 @@ fn doGitMain(allocator: Allocator, repo_root: []const u8, git_dir: []const u8) ?
         }
     }
 
-    if (full_oid) |oid| {
-        result.tag = findExactTag(allocator, git_dir, oid);
+    if (result.hash != null) {
+        var tc: u32 = 0;
+        result.tag = findPointsAtTags(allocator, repo_root, &tc);
+        result.tag_count = tc;
     }
 
     return result;
@@ -275,112 +277,23 @@ fn readU32(allocator: Allocator, dir: std.fs.Dir, name: []const u8) ?u32 {
     return std.fmt.parseInt(u32, std.mem.trim(u8, data, " \t\r\n"), 10) catch null;
 }
 
-// ── Tag lookup (.git/ direct read) ──────────────────────────────
+// ── Tag lookup ──────────────────────────────────────────────────
 
-fn findExactTag(allocator: Allocator, git_dir: []const u8, head_hash: *const [40]u8) ?[]const u8 {
-    // 1. Check packed-refs (covers packed lightweight + annotated tags via ^ lines)
-    if (findTagInPackedRefs(allocator, git_dir, head_hash)) |tag| return tag;
-    // 2. Check loose tags in refs/tags/
-    return findLooseTag(allocator, git_dir, head_hash);
-}
+fn findPointsAtTags(allocator: Allocator, repo_root: []const u8, count: *u32) ?[]const u8 {
+    const out = runGit(allocator, repo_root, &.{ "git", "tag", "--points-at", "HEAD" }) orelse return null;
+    defer allocator.free(out);
 
-fn findTagInPackedRefs(allocator: Allocator, git_dir: []const u8, head_hash: *const [40]u8) ?[]const u8 {
-    var dir = std.fs.cwd().openDir(git_dir, .{}) catch return null;
-    defer dir.close();
-    const content = dir.readFileAlloc(allocator, "packed-refs", 1024 * 1024) catch return null;
-    defer allocator.free(content);
-
-    var prev_tag_name: ?[]const u8 = null; // points into content, no free needed
-    var lines = std.mem.splitScalar(u8, content, '\n');
+    var shortest: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, out, '\n');
     while (lines.next()) |line| {
-        if (line.len == 0 or line[0] == '#') {
-            prev_tag_name = null;
-            continue;
-        }
-        // ^<hash> = dereferenced commit for the previous annotated tag
-        if (line[0] == '^') {
-            if (prev_tag_name) |name| {
-                if (line.len >= 41 and std.mem.eql(u8, line[1..41], head_hash)) {
-                    return allocator.dupe(u8, name) catch null;
-                }
-            }
-            prev_tag_name = null;
-            continue;
-        }
-        // <hash> <ref>
-        prev_tag_name = null;
-        if (line.len >= 52 and line[40] == ' ') { // 40 hash + ' ' + "refs/tags/" (10) + at least 1 char
-            const ref = line[41..];
-            if (std.mem.startsWith(u8, ref, "refs/tags/")) {
-                const tag_name = ref["refs/tags/".len..];
-                // Lightweight tag: hash matches HEAD directly
-                if (std.mem.eql(u8, line[0..40], head_hash)) {
-                    return allocator.dupe(u8, tag_name) catch null;
-                }
-                // Save for potential ^ dereference line
-                prev_tag_name = tag_name;
-            }
+        if (line.len == 0) continue;
+        count.* += 1;
+        if (shortest == null or line.len < shortest.?.len) {
+            if (shortest) |old| allocator.free(old);
+            shortest = allocator.dupe(u8, line) catch continue;
         }
     }
-    return null;
-}
-
-fn findLooseTag(allocator: Allocator, git_dir: []const u8, head_hash: *const [40]u8) ?[]const u8 {
-    const tags_path = std.fmt.allocPrint(allocator, "{s}/refs/tags", .{git_dir}) catch return null;
-    defer allocator.free(tags_path);
-    var tags_dir = std.fs.cwd().openDir(tags_path, .{ .iterate = true }) catch return null;
-    defer tags_dir.close();
-
-    var iter = tags_dir.iterate();
-    while (iter.next() catch null) |entry| {
-        if (entry.kind != .file) continue;
-        const tag_content = tags_dir.readFileAlloc(allocator, entry.name, 256) catch continue;
-        defer allocator.free(tag_content);
-        const tag_hash = std.mem.trim(u8, tag_content, " \t\r\n");
-        if (tag_hash.len >= 40) {
-            // Lightweight tag: direct match
-            if (std.mem.eql(u8, tag_hash[0..40], head_hash)) {
-                return allocator.dupe(u8, entry.name) catch null;
-            }
-            // Annotated tag: read object and resolve target commit
-            if (resolveTagObject(allocator, git_dir, tag_hash[0..40])) |target| {
-                defer allocator.free(target);
-                if (std.mem.eql(u8, target, head_hash)) {
-                    return allocator.dupe(u8, entry.name) catch null;
-                }
-            }
-        }
-    }
-    return null;
-}
-
-/// Read a git tag object and extract the target commit hash.
-/// Returns the 40-char hex hash of the tagged commit, or null.
-fn resolveTagObject(allocator: Allocator, git_dir: []const u8, obj_hash: *const [40]u8) ?[]const u8 {
-    const obj_path = std.fmt.allocPrint(allocator, "{s}/objects/{s}/{s}", .{
-        git_dir, obj_hash[0..2], obj_hash[2..],
-    }) catch return null;
-    defer allocator.free(obj_path);
-
-    const compressed = std.fs.cwd().readFileAlloc(allocator, obj_path, 64 * 1024) catch return null;
-    defer allocator.free(compressed);
-
-    var input_reader = std.io.Reader.fixed(compressed);
-    var decomp = std.compress.flate.Decompress.init(&input_reader, .zlib, &.{});
-    const data = decomp.reader.allocRemaining(allocator, .unlimited) catch return null;
-    defer allocator.free(data);
-
-    // Format: "tag <size>\0object <40hex>\n..."
-    // Find the null byte separating header from content
-    const null_pos = std.mem.indexOfScalar(u8, data, 0) orelse return null;
-    const header = data[0..null_pos];
-    if (!std.mem.startsWith(u8, header, "tag ")) return null;
-
-    const body = data[null_pos + 1 ..];
-    if (std.mem.startsWith(u8, body, "object ") and body.len >= 47) {
-        return allocator.dupe(u8, body[7..47]) catch null;
-    }
-    return null;
+    return shortest;
 }
 
 fn isDir(path: []const u8) bool {
@@ -413,18 +326,27 @@ fn runGit(allocator: Allocator, cwd: []const u8, argv: []const []const u8) ?[]u8
 // ── Output writers ───────────────────────────────────────────────
 
 pub fn writeGitCommit(w: *Writer, main_result: GitMainResult) !void {
-    // On a branch HEAD: skip hash (branch name is enough)
-    if (main_result.branch != null) return;
-    // Detached HEAD: show hash + tag
-    const hash = main_result.hash orelse return;
-    try w.writeAll(" ");
-    try w.writeAll(style.cyan);
-    try w.writeAll(&hash);
+    // Show hash only in detached HEAD mode
+    if (main_result.branch == null) {
+        const hash = main_result.hash orelse return;
+        try w.writeAll(" ");
+        try w.writeAll(style.cyan);
+        try w.writeAll(&hash);
+        try w.writeAll(style.reset);
+    }
+    // Show tag(s) if present — always, even on a branch
     if (main_result.tag) |tag| {
         try w.writeAll(" ");
+        try w.writeAll(style.cyan);
+        try w.writeAll("\xf0\x9f\x8f\xb7\xef\xb8\x8f"); // 🏷️
+        if (main_result.tag_count > 1) {
+            try w.print("({d}) ", .{main_result.tag_count});
+        } else {
+            try w.writeAll(" ");
+        }
         try w.writeAll(tag);
+        try w.writeAll(style.reset);
     }
-    try w.writeAll(style.reset);
 }
 
 pub fn writeGitBranch(w: *Writer, main_result: GitMainResult) !void {
