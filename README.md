@@ -75,6 +75,108 @@ add-zsh-hook precmd _zprompt_precmd
 
 Replace `/path/to/zprompt` with the actual binary path (e.g. `~/src/_mydev/prompt/zig-out/bin/zprompt`).
 
+This is the synchronous setup: the shell blocks until zprompt returns, so in a large
+repository where git collection is slow, the prompt is delayed. If that bothers you, use
+the async setup below instead.
+
+## Async prompt (optional)
+
+In a slow repository the synchronous prompt makes you wait for git before anything appears.
+The async setup shows an **instant** prompt (time + directory) immediately, computes the
+**full** prompt in the background, and swaps it in when ready — without disturbing whatever
+you are typing. It reuses the same binary; no plugin (`zsh-async` etc.) is required.
+
+### CLI options used
+
+| Option | Effect |
+|---|---|
+| `--deadline=<ms>` | Override the shared worker deadline. `--deadline=0` skips the worker threads entirely and emits only the synchronous segments (time, directory, character, duration) — the instant prompt. |
+| `--no-deadline` | Wait for every worker and drop nothing — the full prompt, however long git takes. |
+
+Without either flag the behavior is unchanged (800 ms shared deadline).
+
+### Setup
+
+Replace the synchronous block in `~/.zshrc` with this:
+
+```zsh
+zmodload zsh/system                       # for `sysread` (non-blocking read)
+autoload -Uz add-zsh-hook
+
+typeset -g _zp_bin=/path/to/zprompt        # <- set this to your binary path
+typeset -g _zp_gen=0 _zp_fd=0 _zp_buf='' _zp_t0=''
+typeset -gA _zp_fdgen                        # fd -> generation, for the staleness guard
+
+_zp_preexec() { _zp_t0=$EPOCHREALTIME }
+
+_zp_precmd() {
+    local ec=$? ms dur=0
+    if [[ -n $_zp_t0 ]]; then ms=$(( ($EPOCHREALTIME - $_zp_t0) * 1000 )); dur=${ms%.*}; _zp_t0=''; fi
+
+    # 1) instant prompt: synchronous segments only, shown immediately
+    PROMPT="$($_zp_bin --exit-code=$ec --duration=$dur --deadline=0)"
+
+    # tear down a watcher left over from a previous prompt.
+    # The fd close MUST be inside a brace group (see note below) — a bare
+    # `exec {_zp_fd}<&- 2>/dev/null` permanently redirects the shell's stderr to /dev/null.
+    if (( _zp_fd )); then zle -F $_zp_fd 2>/dev/null; { exec {_zp_fd}<&- } 2>/dev/null; unset "_zp_fdgen[$_zp_fd]"; fi
+    _zp_fd=0; _zp_buf=''; (( _zp_gen++ ))
+
+    # 2) full prompt computed in the background, streamed back over a pipe
+    exec {_zp_fd}< <($_zp_bin --exit-code=$ec --duration=$dur --no-deadline)
+    _zp_fdgen[$_zp_fd]=$_zp_gen
+    zle -F $_zp_fd _zp_cb
+}
+
+_zp_cb() {
+    # zle calls this with $1 = fd whenever it is readable. Drain without blocking;
+    # a failing sysread means EOF, i.e. the background prompt has finished.
+    local fd=$1 chunk
+    if sysread -i $fd chunk 2>/dev/null; then _zp_buf+=$chunk; return; fi
+    local gen=${_zp_fdgen[$fd]}
+    zle -F $fd 2>/dev/null; { exec {fd}<&- } 2>/dev/null; unset "_zp_fdgen[$fd]"; (( fd == _zp_fd )) && _zp_fd=0
+    # apply only if no newer prompt started meanwhile (don't clobber a fresh prompt)
+    if [[ $gen == $_zp_gen && -n $_zp_buf ]]; then PROMPT=$_zp_buf; zle reset-prompt; fi
+    _zp_buf=''
+}
+
+add-zsh-hook preexec _zp_preexec
+add-zsh-hook precmd  _zp_precmd
+```
+
+### How it works, and the one thing you must not remove
+
+`precmd` paints the instant prompt, then starts a background `--no-deadline` run and watches
+its pipe with `zle -F`. When the full prompt arrives, the callback swaps `PROMPT` and calls
+`zle reset-prompt`, which redraws the prompt in place while preserving your edit buffer and
+cursor. Updates only happen while you are at the prompt; once you press Enter, the line is
+final.
+
+The generation guard (`_zp_gen` plus the per-fd `_zp_fdgen` map) is not optional. If the
+background run finishes *after* you have already submitted the command and moved to a new
+prompt, applying its (stale) result would overwrite the new prompt with old data. Each
+background pipe records the generation that started it; the callback applies the result only
+when that generation still matches the current prompt.
+
+Three zsh-specific details matter here. First — and this is the subtle one — the fd close
+is written `{ exec {fd}<&- } 2>/dev/null`, **not** `exec {fd}<&- 2>/dev/null`. `exec` with a
+redirection and no command applies that redirection to the shell *permanently*: a bare
+`exec {fd}<&- 2>/dev/null` closes the fd **and** sends the interactive shell's stderr to
+`/dev/null` forever. `fzf`, `skim` (`sk`), and other full-screen tools draw their UI to
+stderr, so afterwards they render into the void and look like they hang before showing
+anything (the process is fine; `lsof` shows the UI bytes going to `/dev/null`). Wrapping the
+`exec` in a brace group scopes the `2>/dev/null` to the group and restores stderr afterwards,
+leaving only the fd close. Second, `zle -F` takes a plain function *name* — you cannot bake an
+argument into it (`"_zp_cb $gen"` would look for a function literally named that), which is why
+the generation is passed through `_zp_fdgen` instead. Third, end-of-file on the pipe is
+signalled by `sysread` returning non-zero, **not** by a `hup` state argument; waiting for a
+`hup` that never arrives leaves the prompt un-updated and spins the callback. The callback
+therefore treats a failing `sysread` as completion.
+
+Requires zsh with the `zsh/system` module (standard) for `sysread`. If a full prompt can
+exceed the read buffer (rare for a prompt line), the `sysread` accumulation already handles it
+by appending across multiple readable events until EOF.
+
 ## Architecture
 
 ```

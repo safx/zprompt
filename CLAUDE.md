@@ -38,10 +38,10 @@ hyperfine --warmup 5 './zig-out/bin/zprompt --exit-code=0'
 
 All output assembly happens in `main.zig:main()` — it's the orchestrator:
 
-1. Parse `--exit-code=N --duration=MS` args
+1. Parse `--exit-code=N --duration=MS` args, plus `--deadline=MS` / `--no-deadline` (async prompt support)
 2. `findGitRoot()` walks CWD upward looking for `.git/` (synchronous)
-3. Spawn up to 5 worker threads (git_main, git_extras, python, node, aws_sso)
-4. Wait on each thread's `std.Thread.ResetEvent` with a shared 800ms deadline
+3. Spawn up to 5 worker threads (git_main, git_extras, python, node, aws_sso) — skipped entirely when `--deadline=0` (instant prompt: synchronous segments only, race-free)
+4. Wait on each thread's `std.Thread.ResetEvent` with a shared deadline (default 800ms; `--deadline=` overrides, `--no-deadline` blocks until all workers finish)
 5. Assemble output segments into `std.io.Writer.Allocating`, write to stdout
 
 ### Thread worker pattern

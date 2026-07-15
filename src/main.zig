@@ -4,7 +4,7 @@ const modules = @import("modules.zig");
 const style = @import("style.zig");
 
 const Allocator = std.mem.Allocator;
-const TIMEOUT_NS: u64 = 800 * std.time.ns_per_ms;
+const DEFAULT_TIMEOUT_NS: u64 = 800 * std.time.ns_per_ms;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -13,6 +13,8 @@ pub fn main() !void {
     // ── Parse CLI args ───────────────────────────────────────────
     var exit_code: u8 = 0;
     var duration_ms: u64 = 0;
+    var timeout_ns: u64 = DEFAULT_TIMEOUT_NS;
+    var wait_all = false; // --no-deadline: wait for every worker, drop nothing
     {
         var args = std.process.args();
         _ = args.next(); // skip program name
@@ -21,9 +23,22 @@ pub fn main() !void {
                 exit_code = std.fmt.parseInt(u8, arg["--exit-code=".len..], 10) catch 0;
             } else if (std.mem.startsWith(u8, arg, "--duration=")) {
                 duration_ms = std.fmt.parseInt(u64, arg["--duration=".len..], 10) catch 0;
+            } else if (std.mem.startsWith(u8, arg, "--deadline=")) {
+                // override the shared worker deadline (ms). --deadline=0 = instant prompt.
+                const ms = std.fmt.parseInt(u64, arg["--deadline=".len..], 10) catch 800;
+                timeout_ns = ms * std.time.ns_per_ms;
+            } else if (std.mem.eql(u8, arg, "--no-deadline")) {
+                wait_all = true;
             }
         }
     }
+
+    // With --deadline=0 (and not --no-deadline) we skip the worker threads entirely
+    // and emit only the synchronous segments (time, directory, character, duration).
+    // This is both the fastest path and race-free: nothing writes a ctx.result while
+    // main reads it. The async setup pairs this instant prompt with a background
+    // `--no-deadline` run whose full result replaces it via `zle reset-prompt`.
+    const spawn_workers = timeout_ns != 0 or wait_all;
 
     // ── Sync: CWD, git root ──────────────────────────────────────
     const cwd = std.process.getCwdAlloc(allocator) catch "/";
@@ -39,15 +54,21 @@ pub fn main() !void {
     var threads: [5]?std.Thread = .{ null, null, null, null, null };
 
     if (git_root) |root| {
+        // Initialize the contexts unconditionally so their `result` defaults to null;
+        // the output assembly reads these fields whenever git_root != null.
         git_main_ctx = .{ .allocator = allocator, .repo_root = root.repo_root, .git_dir = root.git_dir };
         git_extras_ctx = .{ .allocator = allocator, .git_dir = root.git_dir, .repo_root = root.repo_root };
-        threads[0] = std.Thread.spawn(.{}, git.gitMainWorker, .{&git_main_ctx}) catch null;
-        threads[1] = std.Thread.spawn(.{}, git.gitExtrasWorker, .{&git_extras_ctx}) catch null;
+        if (spawn_workers) {
+            threads[0] = std.Thread.spawn(.{}, git.gitMainWorker, .{&git_main_ctx}) catch null;
+            threads[1] = std.Thread.spawn(.{}, git.gitExtrasWorker, .{&git_extras_ctx}) catch null;
+        }
     }
 
-    threads[2] = std.Thread.spawn(.{}, modules.pythonWorker, .{&python_ctx}) catch null;
-    threads[3] = std.Thread.spawn(.{}, modules.nodeWorker, .{&node_ctx}) catch null;
-    threads[4] = std.Thread.spawn(.{}, modules.awsSsoWorker, .{&aws_ctx}) catch null;
+    if (spawn_workers) {
+        threads[2] = std.Thread.spawn(.{}, modules.pythonWorker, .{&python_ctx}) catch null;
+        threads[3] = std.Thread.spawn(.{}, modules.nodeWorker, .{&node_ctx}) catch null;
+        threads[4] = std.Thread.spawn(.{}, modules.awsSsoWorker, .{&aws_ctx}) catch null;
+    }
 
     // ── Wait with timeout ────────────────────────────────────────
     const start = std.time.nanoTimestamp();
@@ -60,9 +81,13 @@ pub fn main() !void {
 
     for (0..5) |i| {
         if (threads[i] == null) continue;
+        if (wait_all) {
+            events[i].wait(); // --no-deadline: block until this worker finishes
+            continue;
+        }
         const elapsed: u64 = @intCast(@max(0, std.time.nanoTimestamp() - start));
-        const remaining = if (elapsed >= TIMEOUT_NS) 0 else TIMEOUT_NS - elapsed;
-        events[i].timedWait(remaining) catch {};
+        if (elapsed >= timeout_ns) continue; // deadline passed; take whatever is already set
+        events[i].timedWait(timeout_ns - elapsed) catch {};
     }
 
     for (&threads) |*t| {
