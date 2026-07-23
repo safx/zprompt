@@ -2,7 +2,8 @@ const std = @import("std");
 const style = @import("style.zig");
 
 const Allocator = std.mem.Allocator;
-const Writer = std.io.Writer;
+const Io = std.Io;
+const Writer = std.Io.Writer;
 
 // ── Data structures ──────────────────────────────────────────────
 
@@ -42,24 +43,6 @@ pub const GitExtrasResult = struct {
     metrics: ?GitMetrics = null,
 };
 
-// ── Thread contexts ──────────────────────────────────────────────
-
-pub const GitMainCtx = struct {
-    event: std.Thread.ResetEvent = .{},
-    allocator: Allocator,
-    repo_root: []const u8,
-    git_dir: []const u8,
-    result: ?GitMainResult = null,
-};
-
-pub const GitExtrasCtx = struct {
-    event: std.Thread.ResetEvent = .{},
-    allocator: Allocator,
-    git_dir: []const u8,
-    repo_root: []const u8,
-    result: ?GitExtrasResult = null,
-};
-
 // ── findGitRoot ──────────────────────────────────────────────────
 
 pub const GitRoot = struct {
@@ -67,7 +50,7 @@ pub const GitRoot = struct {
     git_dir: []const u8,
 };
 
-pub fn findGitRoot(allocator: Allocator, cwd: []const u8) ?GitRoot {
+pub fn findGitRoot(allocator: Allocator, io: Io, cwd: []const u8) ?GitRoot {
     var path = allocator.dupe(u8, cwd) catch return null;
     while (true) {
         const git_path = std.fmt.allocPrint(allocator, "{s}/.git", .{path}) catch {
@@ -75,11 +58,11 @@ pub fn findGitRoot(allocator: Allocator, cwd: []const u8) ?GitRoot {
             return null;
         };
 
-        if (isDir(git_path)) {
+        if (isDir(io, git_path)) {
             return GitRoot{ .repo_root = path, .git_dir = git_path };
         }
 
-        if (readSmallFile(allocator, git_path)) |content| {
+        if (readSmallFile(allocator, io, git_path)) |content| {
             defer allocator.free(content);
             const trimmed = std.mem.trim(u8, content, " \t\r\n");
             if (std.mem.startsWith(u8, trimmed, "gitdir: ")) {
@@ -122,22 +105,17 @@ pub fn findGitRoot(allocator: Allocator, cwd: []const u8) ?GitRoot {
 }
 
 // ── Workers ──────────────────────────────────────────────────────
+//
+// Spawned as `io.async` tasks in main; each returns its result directly
+// (null = failed/skipped). `timeout` is a shared absolute deadline passed to
+// every git subprocess, so all git work across both workers stops at the same
+// wall-clock instant.
 
-pub fn gitMainWorker(ctx: *GitMainCtx) void {
-    defer ctx.event.set();
-    ctx.result = doGitMain(ctx.allocator, ctx.repo_root, ctx.git_dir);
-}
-
-pub fn gitExtrasWorker(ctx: *GitExtrasCtx) void {
-    defer ctx.event.set();
-    ctx.result = doGitExtras(ctx.allocator, ctx.git_dir, ctx.repo_root);
-}
-
-fn doGitMain(allocator: Allocator, repo_root: []const u8, git_dir: []const u8) ?GitMainResult {
+pub fn doGitMain(allocator: Allocator, io: Io, repo_root: []const u8, git_dir: []const u8, timeout: Io.Timeout) ?GitMainResult {
     _ = git_dir;
     var result = GitMainResult{};
 
-    const status_out = runGit(allocator, repo_root, &.{ "git", "status", "--porcelain=v2", "--branch" }) orelse return null;
+    const status_out = runGit(allocator, io, repo_root, &.{ "git", "status", "--porcelain=v2", "--branch" }, timeout) orelse return null;
     defer allocator.free(status_out);
 
     var lines = std.mem.splitScalar(u8, status_out, '\n');
@@ -171,20 +149,20 @@ fn doGitMain(allocator: Allocator, repo_root: []const u8, git_dir: []const u8) ?
 
     if (result.hash != null) {
         var tc: u32 = 0;
-        result.tag = findPointsAtTags(allocator, repo_root, &tc);
+        result.tag = findPointsAtTags(allocator, io, repo_root, &tc, timeout);
         result.tag_count = tc;
     }
 
     return result;
 }
 
-fn doGitExtras(allocator: Allocator, git_dir: []const u8, repo_root: []const u8) ?GitExtrasResult {
+pub fn doGitExtras(allocator: Allocator, io: Io, git_dir: []const u8, repo_root: []const u8, timeout: Io.Timeout) ?GitExtrasResult {
     var result = GitExtrasResult{};
 
-    result.state = detectState(allocator, git_dir);
+    result.state = detectState(allocator, io, git_dir);
 
-    const diff_out = runGit(allocator, repo_root, &.{ "git", "diff", "--numstat", "HEAD" }) orelse {
-        const cached_out = runGit(allocator, repo_root, &.{ "git", "diff", "--numstat", "--cached" }) orelse return result;
+    const diff_out = runGit(allocator, io, repo_root, &.{ "git", "diff", "--numstat", "HEAD" }, timeout) orelse {
+        const cached_out = runGit(allocator, io, repo_root, &.{ "git", "diff", "--numstat", "--cached" }, timeout) orelse return result;
         result.metrics = parseDiffNumstat(cached_out);
         allocator.free(cached_out);
         return result;
@@ -245,42 +223,42 @@ fn parseDiffNumstat(output: []const u8) ?GitMetrics {
     return if (has_data or metrics.added > 0 or metrics.deleted > 0) metrics else null;
 }
 
-fn detectState(allocator: Allocator, git_dir: []const u8) ?GitState {
-    var dir = std.fs.cwd().openDir(git_dir, .{}) catch return null;
-    defer dir.close();
-    if (checkRebaseDir(allocator, dir, "rebase-merge", "msgnum", "end")) |s| return s;
-    if (checkRebaseDir(allocator, dir, "rebase-apply", "next", "last")) |s| return s;
-    if (dirHasFile(dir, "MERGE_HEAD")) return .{ .label = "MERGING" };
-    if (dirHasFile(dir, "CHERRY_PICK_HEAD")) return .{ .label = "CHERRY-PICKING" };
-    if (dirHasFile(dir, "REVERT_HEAD")) return .{ .label = "REVERTING" };
-    if (dirHasFile(dir, "BISECT_LOG")) return .{ .label = "BISECTING" };
+fn detectState(allocator: Allocator, io: Io, git_dir: []const u8) ?GitState {
+    var dir = Io.Dir.cwd().openDir(io, git_dir, .{}) catch return null;
+    defer dir.close(io);
+    if (checkRebaseDir(allocator, io, dir, "rebase-merge", "msgnum", "end")) |s| return s;
+    if (checkRebaseDir(allocator, io, dir, "rebase-apply", "next", "last")) |s| return s;
+    if (dirHasFile(io, dir, "MERGE_HEAD")) return .{ .label = "MERGING" };
+    if (dirHasFile(io, dir, "CHERRY_PICK_HEAD")) return .{ .label = "CHERRY-PICKING" };
+    if (dirHasFile(io, dir, "REVERT_HEAD")) return .{ .label = "REVERTING" };
+    if (dirHasFile(io, dir, "BISECT_LOG")) return .{ .label = "BISECTING" };
     return null;
 }
 
-fn checkRebaseDir(allocator: Allocator, parent: std.fs.Dir, dir_name: []const u8, current_file: []const u8, total_file: []const u8) ?GitState {
-    var sub = parent.openDir(dir_name, .{}) catch return null;
-    defer sub.close();
+fn checkRebaseDir(allocator: Allocator, io: Io, parent: Io.Dir, dir_name: []const u8, current_file: []const u8, total_file: []const u8) ?GitState {
+    var sub = parent.openDir(io, dir_name, .{}) catch return null;
+    defer sub.close(io);
     var state = GitState{ .label = "REBASING" };
-    state.progress_current = readU32(allocator, sub, current_file);
-    state.progress_total = readU32(allocator, sub, total_file);
+    state.progress_current = readU32(allocator, io, sub, current_file);
+    state.progress_total = readU32(allocator, io, sub, total_file);
     return state;
 }
 
-fn dirHasFile(dir: std.fs.Dir, name: []const u8) bool {
-    dir.access(name, .{}) catch return false;
+fn dirHasFile(io: Io, dir: Io.Dir, name: []const u8) bool {
+    dir.access(io, name, .{}) catch return false;
     return true;
 }
 
-fn readU32(allocator: Allocator, dir: std.fs.Dir, name: []const u8) ?u32 {
-    const data = dir.readFileAlloc(allocator, name, 64) catch return null;
+fn readU32(allocator: Allocator, io: Io, dir: Io.Dir, name: []const u8) ?u32 {
+    const data = dir.readFileAlloc(io, name, allocator, .limited(64)) catch return null;
     defer allocator.free(data);
     return std.fmt.parseInt(u32, std.mem.trim(u8, data, " \t\r\n"), 10) catch null;
 }
 
 // ── Tag lookup ──────────────────────────────────────────────────
 
-fn findPointsAtTags(allocator: Allocator, repo_root: []const u8, count: *u32) ?[]const u8 {
-    const out = runGit(allocator, repo_root, &.{ "git", "tag", "--points-at", "HEAD" }) orelse return null;
+fn findPointsAtTags(allocator: Allocator, io: Io, repo_root: []const u8, count: *u32, timeout: Io.Timeout) ?[]const u8 {
+    const out = runGit(allocator, io, repo_root, &.{ "git", "tag", "--points-at", "HEAD" }, timeout) orelse return null;
     defer allocator.free(out);
 
     var shortest: ?[]const u8 = null;
@@ -296,26 +274,26 @@ fn findPointsAtTags(allocator: Allocator, repo_root: []const u8, count: *u32) ?[
     return shortest;
 }
 
-fn isDir(path: []const u8) bool {
-    var dir = std.fs.cwd().openDir(path, .{}) catch return false;
-    dir.close();
+fn isDir(io: Io, path: []const u8) bool {
+    var dir = Io.Dir.cwd().openDir(io, path, .{}) catch return false;
+    dir.close(io);
     return true;
 }
 
-fn readSmallFile(allocator: Allocator, path: []const u8) ?[]u8 {
-    return std.fs.cwd().readFileAlloc(allocator, path, 8192) catch null;
+fn readSmallFile(allocator: Allocator, io: Io, path: []const u8) ?[]u8 {
+    return Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(8192)) catch null;
 }
 
-fn runGit(allocator: Allocator, cwd: []const u8, argv: []const []const u8) ?[]u8 {
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+fn runGit(allocator: Allocator, io: Io, cwd: []const u8, argv: []const []const u8, timeout: Io.Timeout) ?[]u8 {
+    const result = std.process.run(allocator, io, .{
         .argv = argv,
-        .cwd = cwd,
-        .max_output_bytes = 256 * 1024,
+        .cwd = .{ .path = cwd },
+        .stdout_limit = .limited(256 * 1024),
+        .timeout = timeout,
     }) catch return null;
     allocator.free(result.stderr);
 
-    if (result.term != .Exited or result.term.Exited != 0) {
+    if (result.term != .exited or result.term.exited != 0) {
         allocator.free(result.stdout);
         return null;
     }

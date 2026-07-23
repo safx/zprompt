@@ -2,7 +2,9 @@ const std = @import("std");
 const style = @import("style.zig");
 
 const Allocator = std.mem.Allocator;
-const Writer = std.io.Writer;
+const Io = std.Io;
+const Writer = std.Io.Writer;
+const EnvMap = std.process.Environ.Map;
 
 // ── Data structures ──────────────────────────────────────────────
 
@@ -15,54 +17,23 @@ pub const NodeInfo = struct {
     version: []const u8,
 };
 
-// ── Thread contexts ──────────────────────────────────────────────
-
-pub const PythonCtx = struct {
-    event: std.Thread.ResetEvent = .{},
-    allocator: Allocator,
-    result: ?PythonInfo = null,
-};
-
-pub const NodeCtx = struct {
-    event: std.Thread.ResetEvent = .{},
-    allocator: Allocator,
-    result: ?NodeInfo = null,
-};
-
-pub const AwsSsoCtx = struct {
-    event: std.Thread.ResetEvent = .{},
-    allocator: Allocator,
-    result: ?[]const u8 = null,
-};
-
 // ── Workers ──────────────────────────────────────────────────────
+//
+// Each worker is spawned as an `io.async` task in main and returns its result
+// directly (null = failed/skipped); the Future carries the value back. No
+// completion events are needed — `future.await` synchronizes.
 
-pub fn pythonWorker(ctx: *PythonCtx) void {
-    defer ctx.event.set();
-    ctx.result = doPython(ctx.allocator);
-}
-
-pub fn nodeWorker(ctx: *NodeCtx) void {
-    defer ctx.event.set();
-    ctx.result = doNode(ctx.allocator);
-}
-
-pub fn awsSsoWorker(ctx: *AwsSsoCtx) void {
-    defer ctx.event.set();
-    ctx.result = doAwsSso(ctx.allocator);
-}
-
-fn doPython(allocator: Allocator) ?PythonInfo {
-    if (!hasAnyMarker(&.{
+pub fn doPython(allocator: Allocator, io: Io, env: *const EnvMap, timeout: Io.Timeout) ?PythonInfo {
+    if (!hasAnyMarker(io, &.{
         "pyproject.toml", "requirements.txt", "setup.py",
         "setup.cfg",     ".python-version",  "Pipfile",
         "tox.ini",
     })) return null;
 
-    const version = runVersionCmd(allocator, &.{ "python3", "--version" }, "Python ") orelse return null;
+    const version = runVersionCmd(allocator, io, &.{ "python3", "--version" }, "Python ", timeout) orelse return null;
 
     var virtualenv: ?[]const u8 = null;
-    if (std.posix.getenv("VIRTUAL_ENV")) |venv_path| {
+    if (env.get("VIRTUAL_ENV")) |venv_path| {
         if (std.mem.lastIndexOfScalar(u8, venv_path, '/')) |idx| {
             virtualenv = allocator.dupe(u8, venv_path[idx + 1 ..]) catch null;
         } else {
@@ -73,53 +44,53 @@ fn doPython(allocator: Allocator) ?PythonInfo {
     return PythonInfo{ .version = version, .virtualenv = virtualenv };
 }
 
-fn doNode(allocator: Allocator) ?NodeInfo {
-    if (!hasAnyMarker(&.{ "package.json", ".node-version", ".nvmrc" })) return null;
-    const version = runVersionCmd(allocator, &.{ "node", "--version" }, "v") orelse return null;
+pub fn doNode(allocator: Allocator, io: Io, timeout: Io.Timeout) ?NodeInfo {
+    if (!hasAnyMarker(io, &.{ "package.json", ".node-version", ".nvmrc" })) return null;
+    const version = runVersionCmd(allocator, io, &.{ "node", "--version" }, "v", timeout) orelse return null;
     return NodeInfo{ .version = version };
 }
 
-fn hasAnyMarker(markers: []const []const u8) bool {
+fn hasAnyMarker(io: Io, markers: []const []const u8) bool {
     for (markers) |m| {
-        std.fs.cwd().access(m, .{}) catch continue;
+        Io.Dir.cwd().access(io, m, .{}) catch continue;
         return true;
     }
     return false;
 }
 
-fn runVersionCmd(allocator: Allocator, argv: []const []const u8, prefix: []const u8) ?[]const u8 {
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+fn runVersionCmd(allocator: Allocator, io: Io, argv: []const []const u8, prefix: []const u8, timeout: Io.Timeout) ?[]const u8 {
+    const result = std.process.run(allocator, io, .{
         .argv = argv,
+        .timeout = timeout,
     }) catch return null;
     defer allocator.free(result.stderr);
     defer allocator.free(result.stdout);
-    if (result.term != .Exited or result.term.Exited != 0) return null;
+    if (result.term != .exited or result.term.exited != 0) return null;
     var out = std.mem.trim(u8, result.stdout, " \t\r\n");
     if (prefix.len > 0 and std.mem.startsWith(u8, out, prefix)) out = out[prefix.len..];
     return allocator.dupe(u8, out) catch null;
 }
 
-fn doAwsSso(allocator: Allocator) ?[]const u8 {
-    const home = std.posix.getenv("HOME") orelse return null;
+pub fn doAwsSso(allocator: Allocator, io: Io, env: *const EnvMap) ?[]const u8 {
+    const home = env.get("HOME") orelse return null;
     const cache_dir_path = std.fmt.allocPrint(allocator, "{s}/.aws/sso/cache", .{home}) catch return null;
     defer allocator.free(cache_dir_path);
 
-    var cache_dir = std.fs.cwd().openDir(cache_dir_path, .{ .iterate = true }) catch return null;
-    defer cache_dir.close();
+    var cache_dir = Io.Dir.cwd().openDir(io, cache_dir_path, .{ .iterate = true }) catch return null;
+    defer cache_dir.close(io);
 
     var newest_name: ?[]const u8 = null;
-    var newest_mtime: i128 = 0;
+    var newest_mtime: i96 = 0;
 
     var iter = cache_dir.iterate();
-    while (iter.next() catch null) |entry| {
+    while (iter.next(io) catch null) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
-        const stat = cache_dir.statFile(entry.name) catch continue;
-        if (newest_name == null or stat.mtime > newest_mtime) {
+        const stat = cache_dir.statFile(io, entry.name, .{}) catch continue;
+        if (newest_name == null or stat.mtime.nanoseconds > newest_mtime) {
             if (newest_name) |old| allocator.free(old);
             newest_name = allocator.dupe(u8, entry.name) catch continue;
-            newest_mtime = stat.mtime;
+            newest_mtime = stat.mtime.nanoseconds;
         }
     }
 
@@ -129,7 +100,7 @@ fn doAwsSso(allocator: Allocator) ?[]const u8 {
     const file_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ cache_dir_path, name }) catch return null;
     defer allocator.free(file_path);
 
-    const content = std.fs.cwd().readFileAlloc(allocator, file_path, 64 * 1024) catch return null;
+    const content = Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(64 * 1024)) catch return null;
     defer allocator.free(content);
 
     const key = "\"expiresAt\"";
@@ -143,7 +114,7 @@ fn doAwsSso(allocator: Allocator) ?[]const u8 {
     const expires_str = after_key[value_start..i];
 
     const expires_epoch = parseIso8601(expires_str) orelse return null;
-    const now = std.time.timestamp();
+    const now = Io.Timestamp.now(io, .real).toSeconds();
     const remaining = expires_epoch - now;
     if (remaining <= 0) return null;
 
@@ -186,8 +157,8 @@ fn isLeapYear(y: i64) bool {
 
 // ── Output writers ───────────────────────────────────────────────
 
-pub fn writeTime(w: *Writer) !void {
-    const ts = std.time.timestamp() + 9 * 3600;
+pub fn writeTime(w: *Writer, io: Io) !void {
+    const ts = Io.Timestamp.now(io, .real).toSeconds() + 9 * 3600;
     const day_seconds: u64 = @intCast(@mod(ts, 86400));
     const h = day_seconds / 3600;
     const m = (day_seconds % 3600) / 60;
@@ -195,8 +166,8 @@ pub fn writeTime(w: *Writer) !void {
     try w.print("{d:0>2}:{d:0>2}:{d:0>2}", .{ h, m, s });
 }
 
-pub fn writeDirectory(w: *Writer, cwd: []const u8, repo_root: ?[]const u8) !void {
-    const home = std.posix.getenv("HOME") orelse "";
+pub fn writeDirectory(w: *Writer, io: Io, env: *const EnvMap, cwd: []const u8, repo_root: ?[]const u8) !void {
+    const home = env.get("HOME") orelse "";
 
     if (repo_root) |root| {
         const repo_name_start = if (std.mem.lastIndexOfScalar(u8, root, '/')) |idx| idx + 1 else 0;
@@ -262,7 +233,7 @@ pub fn writeDirectory(w: *Writer, cwd: []const u8, repo_root: ?[]const u8) !void
         }
     }
 
-    std.fs.cwd().access(".", .{ .mode = .write_only }) catch {
+    Io.Dir.cwd().access(io, ".", .{ .write = true }) catch {
         try w.writeAll(" \xf0\x9f\x94\x92"); // 🔒
         return;
     };

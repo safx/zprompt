@@ -13,7 +13,7 @@ pub const fg_666 = "%{\x1b[38;2;102;102;102m%}";
 pub const fg_f60 = "%{\x1b[38;2;255;96;96m%}";
 
 const std = @import("std");
-const Writer = std.io.Writer;
+const Writer = std.Io.Writer;
 
 pub fn styled(w: *Writer, color: []const u8, text: []const u8) !void {
     try w.writeAll(color);

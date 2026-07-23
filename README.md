@@ -4,8 +4,8 @@ A fast, minimal zsh prompt written in Zig. Replaces [Starship](https://starship.
 
 ## Why
 
-- **121 KB** binary vs Starship's 8.2 MB (68x smaller)
-- **26 ms** average render vs Starship's 38 ms (1.4x faster)
+- **197 KB** binary vs Starship's 8.2 MB (42x smaller)
+- **29 ms** average render vs Starship's 41 ms (1.4x faster)
 - Zero dependencies beyond system `git`
 - All configuration is compiled in — modify the source and rebuild
 - 4 source files, easy to understand and modify with an LLM
@@ -39,7 +39,7 @@ HH:MM:SS ~/path/to/repo a3f7b2c 🏷️(9) shortest-tag ● js22.1.0
 
 ## Build
 
-Requires [Zig](https://ziglang.org/) 0.15.2+.
+Requires [Zig](https://ziglang.org/) 0.16.0.
 
 ```sh
 # Development build
@@ -90,7 +90,7 @@ you are typing. It reuses the same binary; no plugin (`zsh-async` etc.) is requi
 
 | Option | Effect |
 |---|---|
-| `--deadline=<ms>` | Override the shared worker deadline. `--deadline=0` skips the worker threads entirely and emits only the synchronous segments (time, directory, character, duration) — the instant prompt. |
+| `--deadline=<ms>` | Override the shared worker deadline. `--deadline=0` skips the workers entirely and emits only the synchronous segments (time, directory, character, duration) — the instant prompt. |
 | `--no-deadline` | Wait for every worker and drop nothing — the full prompt, however long git takes. |
 
 Without either flag the behavior is unchanged (800 ms shared deadline).
@@ -181,17 +181,17 @@ by appending across multiple readable events until EOF.
 
 ```
 src/
-├── main.zig      Entry point, arg parsing, thread orchestration, output assembly
+├── main.zig      Entry point, arg parsing, async orchestration, output assembly
 ├── git.zig       Git info collection (.git/ reads + git subprocess)
 ├── modules.zig   Non-git modules (time, directory, python, node, aws, duration)
 └── style.zig     ANSI color constants with zsh %{..%} wrapping
 ```
 
-### Thread model
+### Concurrency model
 
-5 worker threads run in parallel with an 800 ms shared deadline:
+5 workers run in parallel via `io.async` (Zig 0.16's `std.Io`), sharing one 800 ms deadline:
 
-| Thread | Work | Method |
+| Worker | Work | Method |
 |---|---|---|
 | git_main | branch, status, ahead/behind, hash, tag | `git status --porcelain=v2 --branch` + `git tag --points-at HEAD` |
 | git_extras | state detection, diff metrics | `.git/` file reads + `git diff --numstat` |
@@ -199,9 +199,9 @@ src/
 | node | version | marker file check + `node --version` |
 | aws_sso | session remaining time | `~/.aws/sso/cache/*.json` read + ISO 8601 parse |
 
-Threads signal completion via `std.Thread.ResetEvent`. The main thread calls `timedWait` on each event with the remaining budget from the shared 800 ms deadline. Timed-out threads are detached — the process exits shortly after and the OS cleans up.
+Each worker is a function returning `?Result`; `io.async` returns a `Future` whose value main collects with `await`. The 800 ms budget is one absolute `Io.Timeout` passed to every subprocess (`std.process.run`'s `timeout`), so all git/version calls stop at the same wall-clock instant while the prompt still returns as soon as the work finishes. A subprocess that overruns is killed and its result dropped to `null`. `--no-deadline` passes `.none` (wait for everything); `--deadline=0` skips the workers entirely.
 
-Synchronous (no thread): time, directory, character, cmd_duration.
+Synchronous (no worker): time, directory, character, cmd_duration.
 
 ### Error handling
 
@@ -216,11 +216,11 @@ All configuration is compiled into the binary. To customize:
 
 ## Benchmarks
 
-Measured with `hyperfine --warmup 5 --runs 50` in a git repository on macOS arm64:
+Measured with `hyperfine --warmup 10 --runs 100` in a git repository on macOS arm64:
 
-| | zprompt | Starship 1.24.2 |
+| | zprompt | Starship 1.26.0 |
 |---|---|---|
-| Binary size | 121 KB | 8.2 MB |
-| Mean | 26.2 ms | 37.7 ms |
-| Min | 20.2 ms | 28.2 ms |
-| Std dev | ±3.5 ms | ±9.6 ms |
+| Binary size | 197 KB | 8.2 MB |
+| Mean | 29.4 ms | 41.1 ms |
+| Min | 23.4 ms | 27.0 ms |
+| Std dev | ±4.9 ms | ±5.3 ms |
