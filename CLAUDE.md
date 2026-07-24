@@ -39,16 +39,16 @@ hyperfine --warmup 5 './zig-out/bin/zprompt --exit-code=0'
 `main` takes `std.process.Init` (the 0.16 entry-point form); from it come the `Io` (a thread-pool-backed implementation whose spawned children inherit this process's environment), the `Environ.Map` for env lookups, and the CLI arg vector. All output assembly happens in `main.zig:main()` — it's the orchestrator:
 
 1. Parse `--exit-code=N --duration=MS` args (from `init.minimal.args.vector`), plus `--deadline=MS` / `--no-deadline` (async prompt support)
-2. `findGitRoot()` walks CWD upward looking for `.git/` (synchronous)
-3. Spawn up to 5 workers via `io.async` (git_main, git_extras, python, node, aws_sso) — skipped entirely when `--deadline=0` (instant prompt: synchronous segments only)
-4. Compute one absolute `Io.Timeout` deadline (default 800ms; `--deadline=` overrides, `--no-deadline` → `.none`) shared by every subprocess across all workers; `await` each future
+2. Pin one absolute `Io.Timeout` deadline (default 800ms; `--deadline=` overrides, `--no-deadline` → `.none`) that bounds the **whole** collection phase and is also passed to every subprocess
+3. Spawn 5 workers into an `Io.Group` via `concurrent` (git, python, node, aws_sso, readonly) — skipped entirely when `--deadline=0` (instant prompt: synchronous segments only, plus a synchronous `findGitRoot`/readonly check for the directory segment). The git worker runs `findGitRoot()` itself — it walks the directory tree and can block forever on a dead network mount, so it must not run on the main task — then `doGitMain` here and `doGitExtras` on a second thread
+4. Race the worker group against a sleeper pinned to the same deadline (`Io.Select` over `union(enum) { workers, deadline }`). Workers publish into `Slot`s (value + atomic ready flag), so main can safely read partial results. If the sleeper wins, main assembles from the ready slots, writes, and calls `std.process.exit(0)` — deliberately not `Group.cancel` (cancelation *waits* for each task, so a worker stuck in an uninterruptible filesystem call would block it forever) and not a normal return (the Io teardown would join the stuck threads)
 5. Assemble output segments into `std.Io.Writer.Allocating`, write to stdout via `std.Io.File.stdout().writeStreamingAll(io, ...)`
 
-The deadline is enforced per-subprocess (`RunOptions.timeout`), not by a separate wait loop: because all workers run concurrently and share one absolute deadline, wall-clock is bounded by the deadline yet returns early when git is fast. `smp_allocator` is used (threadsafe, no leak-tracking) rather than `init.gpa`, since the process leaks-and-exits by design.
+The deadline is enforced at two layers: `RunOptions.timeout` kills overrunning subprocesses, and the Select race + process exit bounds the filesystem-only paths (findGitRoot, marker checks, aws cache scan) that take no timeout. Wall-clock is bounded by the deadline yet main returns early when the workers are fast. `smp_allocator` is used (threadsafe, no leak-tracking) rather than `init.gpa`, since the process leaks-and-exits by design.
 
 ### Worker pattern
 
-Each worker is a plain function returning `?ResultType` (null = failed/skipped), spawned with `io.async(doFoo, .{args...})`; the `Future` carries the value back on `await`. No completion events — `await` synchronizes. All errors convert to `null` via `catch return null`. The assembly skips null results with `if (result) |r| ...`.
+Each worker is a plain function that computes `?ResultType` (null = failed/skipped) and publishes it into a `Slot` — value plus atomic `ready` flag (release on publish, acquire on read) — so main can read whatever is finished even while other workers are still running. Workers are spawned with `group.concurrent(...) catch group.async(...)`: `concurrent` guarantees a dedicated unit of concurrency (which the shared-deadline design assumes), `async` is the degraded fallback that may run inline. All errors convert to `null` via `catch return null`. The assembly skips unready/null slots with `if (slots.foo.get()) |r| ...`.
 
 ### Git info collection strategy
 
@@ -64,7 +64,7 @@ Segments write directly to `*std.Io.Writer`. ANSI codes are wrapped in `%{..%}` 
 0.16 moved I/O, time, and process/filesystem access behind the `std.Io` interface. Non-obvious points that differ from 0.15 and from most online examples:
 
 - **Entry point**: `pub fn main(init: std.process.Init) !void`. Use `init.io` (Io), `init.environ_map` (env lookups; `.get(key)`), `init.minimal.args.vector` (args). The runtime configures `init.io`'s child environment from the real process environ, so spawned commands inherit `PATH`/`HOME`.
-- **Concurrency**: `std.Thread.ResetEvent`/`Mutex`/etc. are gone; use `io.async(fn, args)` → `Future`, then `future.await(io)`. `std.Thread` keeps only `spawn`/`join`/`detach`/`getCpuCount`.
+- **Concurrency**: `std.Thread.ResetEvent`/`Mutex`/etc. are gone. `io.async(fn, args)` → `Future` + `future.await(io)`, but async **may run inline** (weaker guarantee); `io.concurrent` / `Group.concurrent` guarantee a dedicated unit of concurrency and fail with `error.ConcurrencyUnavailable` (single-threaded build, thread-spawn failure). `Io.Group` awaits/cancels tasks as a whole; `Io.Select(U)` races tasks and returns the first completion. Cancelation (`Future.cancel`, `Group.cancel`, `Select.cancelDiscard`) delivers `error.Canceled` at the task's next cancelation point and **waits** for it — a task blocked in an uninterruptible syscall blocks the cancel too. `Timeout.sleep(io)` is a cancelation point, so canceling a sleeper wakes it promptly.
 - **Output buffer**: `std.Io.Writer.Allocating` (the `std.io` lowercase namespace no longer exists; it's `std.Io`). `.init`/`.writer`/`.toArrayList`/`.deinit` unchanged.
 - **stdout**: `std.Io.File.stdout().writeStreamingAll(io, bytes)` (no more `std.fs.File{ .handle = ... }`).
 - **Subprocess**: `std.process.run(gpa, io, .{ .argv, .cwd = .{ .path = ... }, .stdout_limit = .limited(N), .timeout })` replaces `Child.run`. `RunResult.term` is now lowercase: `result.term != .exited or result.term.exited != 0`.

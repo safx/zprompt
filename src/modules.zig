@@ -61,6 +61,10 @@ fn hasAnyMarker(io: Io, markers: []const []const u8) bool {
 fn runVersionCmd(allocator: Allocator, io: Io, argv: []const []const u8, prefix: []const u8, timeout: Io.Timeout) ?[]const u8 {
     const result = std.process.run(allocator, io, .{
         .argv = argv,
+        // A version string is one short line; 0.16 defaults both limits to
+        // .unlimited, so cap them like 0.15's Child.run (50 KiB) did.
+        .stdout_limit = .limited(50 * 1024),
+        .stderr_limit = .limited(50 * 1024),
         .timeout = timeout,
     }) catch return null;
     defer allocator.free(result.stderr);
@@ -88,8 +92,12 @@ pub fn doAwsSso(allocator: Allocator, io: Io, env: *const EnvMap) ?[]const u8 {
         if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
         const stat = cache_dir.statFile(io, entry.name, .{}) catch continue;
         if (newest_name == null or stat.mtime.nanoseconds > newest_mtime) {
+            // dupe before freeing the old candidate: freeing first would leave
+            // `newest_name` dangling if the dupe fails and `continue` skips
+            // the reassignment.
+            const duped = allocator.dupe(u8, entry.name) catch continue;
             if (newest_name) |old| allocator.free(old);
-            newest_name = allocator.dupe(u8, entry.name) catch continue;
+            newest_name = duped;
             newest_mtime = stat.mtime.nanoseconds;
         }
     }
@@ -166,7 +174,15 @@ pub fn writeTime(w: *Writer, io: Io) !void {
     try w.print("{d:0>2}:{d:0>2}:{d:0>2}", .{ h, m, s });
 }
 
-pub fn writeDirectory(w: *Writer, io: Io, env: *const EnvMap, cwd: []const u8, repo_root: ?[]const u8) !void {
+/// Whether the cwd lacks write permission (drawn as 🔒 by writeDirectory).
+/// Run inside a worker on the deadline path: on a dead network mount this
+/// `access` call can block indefinitely.
+pub fn isCwdReadonly(io: Io) bool {
+    Io.Dir.cwd().access(io, ".", .{ .write = true }) catch return true;
+    return false;
+}
+
+pub fn writeDirectory(w: *Writer, env: *const EnvMap, cwd: []const u8, repo_root: ?[]const u8, readonly: bool) !void {
     const home = env.get("HOME") orelse "";
 
     if (repo_root) |root| {
@@ -233,10 +249,7 @@ pub fn writeDirectory(w: *Writer, io: Io, env: *const EnvMap, cwd: []const u8, r
         }
     }
 
-    Io.Dir.cwd().access(io, ".", .{ .write = true }) catch {
-        try w.writeAll(" \xf0\x9f\x94\x92"); // 🔒
-        return;
-    };
+    if (readonly) try w.writeAll(" \xf0\x9f\x94\x92"); // 🔒
 }
 
 pub fn writeCmdDuration(w: *Writer, duration_ms: u64) !void {

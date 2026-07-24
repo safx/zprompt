@@ -90,7 +90,7 @@ you are typing. It reuses the same binary; no plugin (`zsh-async` etc.) is requi
 
 | Option | Effect |
 |---|---|
-| `--deadline=<ms>` | Override the shared worker deadline. `--deadline=0` skips the workers entirely and emits only the synchronous segments (time, directory, character, duration) — the instant prompt. |
+| `--deadline=<ms>` | Override the shared deadline (default 800 ms). It is pinned to one absolute instant that bounds the **whole** collection phase — repo-root discovery, filesystem probes, and every subprocess — so the prompt always renders within the budget, with whatever finished. `--deadline=0` skips the workers entirely and emits only the synchronous segments (time, directory, character, duration) — the instant prompt. |
 | `--no-deadline` | Wait for every worker and drop nothing — the full prompt, however long git takes. |
 
 Without either flag the behavior is unchanged (800 ms shared deadline).
@@ -106,6 +106,7 @@ autoload -Uz add-zsh-hook
 typeset -g _zp_bin=/path/to/zprompt        # <- set this to your binary path
 typeset -g _zp_gen=0 _zp_fd=0 _zp_buf='' _zp_t0=''
 typeset -gA _zp_fdgen                        # fd -> generation, for the staleness guard
+typeset -gA _zp_fdpid                        # fd -> background zprompt PID, so it can be reaped
 
 _zp_preexec() { _zp_t0=$EPOCHREALTIME }
 
@@ -116,15 +117,23 @@ _zp_precmd() {
     # 1) instant prompt: synchronous segments only, shown immediately
     PROMPT="$($_zp_bin --exit-code=$ec --duration=$dur --deadline=0)"
 
-    # tear down a watcher left over from a previous prompt.
+    # tear down a watcher left over from a previous prompt, and kill its zprompt
+    # if it is still running — closing the fd alone would leave the abandoned
+    # process (and its git children) running, one leak per prompt in a slow repo.
     # The fd close MUST be inside a brace group (see note below) — a bare
     # `exec {_zp_fd}<&- 2>/dev/null` permanently redirects the shell's stderr to /dev/null.
-    if (( _zp_fd )); then zle -F $_zp_fd 2>/dev/null; { exec {_zp_fd}<&- } 2>/dev/null; unset "_zp_fdgen[$_zp_fd]"; fi
+    if (( _zp_fd )); then
+        zle -F $_zp_fd 2>/dev/null
+        { exec {_zp_fd}<&- } 2>/dev/null
+        [[ -n ${_zp_fdpid[$_zp_fd]} ]] && kill ${_zp_fdpid[$_zp_fd]} 2>/dev/null
+        unset "_zp_fdgen[$_zp_fd]" "_zp_fdpid[$_zp_fd]"
+    fi
     _zp_fd=0; _zp_buf=''; (( _zp_gen++ ))
 
     # 2) full prompt computed in the background, streamed back over a pipe
     exec {_zp_fd}< <($_zp_bin --exit-code=$ec --duration=$dur --no-deadline)
     _zp_fdgen[$_zp_fd]=$_zp_gen
+    _zp_fdpid[$_zp_fd]=$sysparams[procsubstpid]   # $! is NOT set for <(...); zsh/system provides the PID
     zle -F $_zp_fd _zp_cb
 }
 
@@ -134,7 +143,9 @@ _zp_cb() {
     local fd=$1 chunk
     if sysread -i $fd chunk 2>/dev/null; then _zp_buf+=$chunk; return; fi
     local gen=${_zp_fdgen[$fd]}
-    zle -F $fd 2>/dev/null; { exec {fd}<&- } 2>/dev/null; unset "_zp_fdgen[$fd]"; (( fd == _zp_fd )) && _zp_fd=0
+    # drop the recorded PID: the process has finished on its own, and a later
+    # kill could hit an unrelated process that reused the PID
+    zle -F $fd 2>/dev/null; { exec {fd}<&- } 2>/dev/null; unset "_zp_fdgen[$fd]" "_zp_fdpid[$fd]"; (( fd == _zp_fd )) && _zp_fd=0
     # apply only if no newer prompt started meanwhile (don't clobber a fresh prompt)
     if [[ $gen == $_zp_gen && -n $_zp_buf ]]; then PROMPT=$_zp_buf; zle reset-prompt; fi
     _zp_buf=''
@@ -158,7 +169,16 @@ prompt, applying its (stale) result would overwrite the new prompt with old data
 background pipe records the generation that started it; the callback applies the result only
 when that generation still matches the current prompt.
 
-Three zsh-specific details matter here. First — and this is the subtle one — the fd close
+The PID bookkeeping (`_zp_fdpid`) is how superseded runs get reaped. A `--no-deadline` run
+has no time bound by design, so on a slow repo it can outlive its prompt; without the `kill`,
+every new prompt would abandon the previous process (plus its git children) and let it run to
+completion in the background — one leaked process per keystroke in the worst case. Killing
+the zprompt also takes care of its children: their stdout pipes close, so a still-running git
+dies on the next write. The callback unsets the recorded PID when the pipe reaches EOF, so a
+process that finished on its own is never killed — protection against the (tiny) window where
+the OS could hand the freed PID to an unrelated process.
+
+Four zsh-specific details matter here. First — and this is the subtle one — the fd close
 is written `{ exec {fd}<&- } 2>/dev/null`, **not** `exec {fd}<&- 2>/dev/null`. `exec` with a
 redirection and no command applies that redirection to the shell *permanently*: a bare
 `exec {fd}<&- 2>/dev/null` closes the fd **and** sends the interactive shell's stderr to
@@ -171,7 +191,10 @@ argument into it (`"_zp_cb $gen"` would look for a function literally named that
 the generation is passed through `_zp_fdgen` instead. Third, end-of-file on the pipe is
 signalled by `sysread` returning non-zero, **not** by a `hup` state argument; waiting for a
 `hup` that never arrives leaves the prompt un-updated and spins the callback. The callback
-therefore treats a failing `sysread` as completion.
+therefore treats a failing `sysread` as completion. Fourth, `$!` is **not** set by `<(...)`
+process substitution in zsh (it stays at its previous value); the substituted process's PID is
+exposed as `$sysparams[procsubstpid]` by the `zsh/system` module — which this setup already
+loads for `sysread`.
 
 Requires zsh with the `zsh/system` module (standard) for `sysread`. If a full prompt can
 exceed the read buffer (rare for a prompt line), the `sysread` accumulation already handles it
@@ -189,17 +212,17 @@ src/
 
 ### Concurrency model
 
-5 workers run in parallel via `io.async` (Zig 0.16's `std.Io`), sharing one 800 ms deadline:
+5 workers run in parallel (spawned with `Io.Group.concurrent`, Zig 0.16's `std.Io`), sharing one 800 ms deadline:
 
 | Worker | Work | Method |
 |---|---|---|
-| git_main | branch, status, ahead/behind, hash, tag | `git status --porcelain=v2 --branch` + `git tag --points-at HEAD` |
-| git_extras | state detection, diff metrics | `.git/` file reads + `git diff --numstat` |
+| git | repo-root discovery, then branch/status/hash/tag + state/metrics | `findGitRoot` walk, then `git status --porcelain=v2 --branch` + `git tag --points-at HEAD`; extras (`.git/` reads + `git diff --numstat`) on a second thread |
 | python | version + virtualenv | marker file check + `python3 --version` |
 | node | version | marker file check + `node --version` |
 | aws_sso | session remaining time | `~/.aws/sso/cache/*.json` read + ISO 8601 parse |
+| readonly | 🔒 marker for the directory segment | `access(".", W_OK)` |
 
-Each worker is a function returning `?Result`; `io.async` returns a `Future` whose value main collects with `await`. The 800 ms budget is one absolute `Io.Timeout` passed to every subprocess (`std.process.run`'s `timeout`), so all git/version calls stop at the same wall-clock instant while the prompt still returns as soon as the work finishes. A subprocess that overruns is killed and its result dropped to `null`. `--no-deadline` passes `.none` (wait for everything); `--deadline=0` skips the workers entirely.
+Each worker computes `?Result` and publishes it into a slot (value + atomic ready flag). The 800 ms budget is pinned to one absolute `Io.Timeout` deadline that is used twice: it is passed to every subprocess (`std.process.run`'s `timeout`), and it is raced (`Io.Select`) against the worker group as a whole — main wakes on whichever finishes first, "all workers done" or a sleeper pinned to the deadline. If the deadline wins, main renders whatever slots are ready and exits the process immediately; that exit is what bounds the filesystem-only paths (`findGitRoot`, marker checks, the aws cache scan), which take no timeout and can block indefinitely on a dead network mount — something the subprocess timeouts alone cannot cover. A subprocess that overruns is killed and its result dropped to `null`. `--no-deadline` passes `.none` and skips the race (wait for everything); `--deadline=0` skips the workers entirely.
 
 Synchronous (no worker): time, directory, character, cmd_duration.
 

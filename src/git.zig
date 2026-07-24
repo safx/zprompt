@@ -106,10 +106,10 @@ pub fn findGitRoot(allocator: Allocator, io: Io, cwd: []const u8) ?GitRoot {
 
 // ── Workers ──────────────────────────────────────────────────────
 //
-// Spawned as `io.async` tasks in main; each returns its result directly
-// (null = failed/skipped). `timeout` is a shared absolute deadline passed to
-// every git subprocess, so all git work across both workers stops at the same
-// wall-clock instant.
+// Run inside main's git worker task (spawned via `Io.Group.concurrent`); each
+// returns its result directly (null = failed/skipped). `timeout` is a shared
+// absolute deadline passed to every git subprocess, so all git work across
+// both workers stops at the same wall-clock instant.
 
 pub fn doGitMain(allocator: Allocator, io: Io, repo_root: []const u8, git_dir: []const u8, timeout: Io.Timeout) ?GitMainResult {
     _ = git_dir;
@@ -289,6 +289,9 @@ fn runGit(allocator: Allocator, io: Io, cwd: []const u8, argv: []const []const u
         .argv = argv,
         .cwd = .{ .path = cwd },
         .stdout_limit = .limited(256 * 1024),
+        // 0.16 defaults stderr to .unlimited; cap it like stdout so a noisy
+        // hook or corrupted repo can't buffer unbounded diagnostics.
+        .stderr_limit = .limited(256 * 1024),
         .timeout = timeout,
     }) catch return null;
     allocator.free(result.stderr);
