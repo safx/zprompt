@@ -39,7 +39,7 @@ HH:MM:SS ~/path/to/repo a3f7b2c 🏷️(9) shortest-tag ● js22.1.0
 
 ## Build
 
-Requires [Zig](https://ziglang.org/) 0.16.0.
+Requires [Zig](https://ziglang.org/) 0.17.0.
 
 ```sh
 # Development build
