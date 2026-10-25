@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-zprompt is a compiled zsh prompt binary written in Zig 0.16.0. It replaces Starship by hardcoding all configuration into the source. No config file parsing — edit the source, rebuild, done.
+zprompt is a compiled zsh prompt binary written in Zig 0.17.0. It replaces Starship by hardcoding all configuration into the source. No config file parsing — edit the source, rebuild, done.
 
 The original Starship config it replicates is `starship.toml` (kept for reference).
 
@@ -59,7 +59,7 @@ Each worker is a plain function that computes `?ResultType` (null = failed/skipp
 
 Segments write directly to `*std.Io.Writer`. ANSI codes are wrapped in `%{..%}` for zsh prompt width calculation (defined in `style.zig`). The segment order in main.zig matches the starship.toml `format` string exactly.
 
-## Zig 0.16.0 API Notes
+## Zig 0.16+ API Notes
 
 0.16 moved I/O, time, and process/filesystem access behind the `std.Io` interface. Non-obvious points that differ from 0.15 and from most online examples:
 
@@ -71,4 +71,4 @@ Segments write directly to `*std.Io.Writer`. ANSI codes are wrapped in `%{..%}` 
 - **Filesystem**: `std.fs` is gutted (only `std.fs.path` remains). Use `std.Io.Dir.cwd()` then `.openDir(io, ...)`, `.access(io, sub, .{ .write = true })`, `.readFileAlloc(io, sub, gpa, .limited(N))`, `.statFile(io, sub, .{})` (mtime is `Io.Timestamp`, compare `.nanoseconds`), `.iterate()` + `.next(io)`, `.close(io)`.
 - **Time**: `std.time` has only constants; wall clock is `std.Io.Timestamp.now(io, .real).toSeconds()`.
 - **Timeout**: build `Io.Timeout{ .duration = .{ .raw = .{ .nanoseconds = ms * ns_per_ms }, .clock = .awake } }`, then `.toDeadline(io)` to pin an absolute deadline shareable across calls.
-- **build.zig**: unchanged from 0.15 — `b.createModule(.{ .root_source_file = ... })` passed to `.root_module`.
+- **build.zig**: `b.createModule(.{ .root_source_file = ... })` passed to `.root_module` (unchanged from 0.15). 0.17 removed `b.args`; forward `zig build run -- ...` args with `run_cmd.addPassthruArgs()`.
